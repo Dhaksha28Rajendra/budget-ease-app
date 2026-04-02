@@ -1,0 +1,528 @@
+// recommendation_screen.dart
+import 'package:flutter/material.dart';
+
+import '../core/app_colors.dart';
+import '../data/database/profile_update_dao.dart';
+import '../data/database/notification_dao.dart';
+import '../data/database/dashboard_dao.dart';
+import '../services/recommendation_api.dart';
+
+class RecommendationScreen extends StatefulWidget {
+  final String studentId;
+
+  const RecommendationScreen({super.key, required this.studentId});
+
+  @override
+  State<RecommendationScreen> createState() => _RecommendationScreenState();
+}
+
+class _RecommendationScreenState extends State<RecommendationScreen> {
+  final ProfileUpdateDAO _profileDao = ProfileUpdateDAO();
+  final NotificationDao _notificationDao = NotificationDao();
+  final DashboardDao _dashDao = DashboardDao();
+
+  Map<String, dynamic>? recoResult;
+  bool recoLoading = false;
+  String? recoError;
+
+  // history lists (grouped) — only previous records
+  List<Map<String, dynamic>> _recent = [];
+  List<Map<String, dynamic>> _yesterday = [];
+  List<Map<String, dynamic>> _last7 = [];
+  List<Map<String, dynamic>> _last30 = [];
+
+  @override
+  void initState() {
+    super.initState();
+    loadRecommendation();
+    _loadRecommendationHistory(); // initial load (no insertion of current)
+  }
+
+  Future<void> loadRecommendation() async {
+    setState(() {
+      recoLoading = true;
+      recoError = null;
+    });
+
+    try {
+      // Profile types
+      final types = await _profileDao.getLatestTypesByStudentId(
+        widget.studentId,
+      );
+      final incomeType = (types["income_type"] ?? "").trim();
+      final spenderType = (types["spender_type"] ?? "").trim();
+      if (incomeType.isEmpty || spenderType.isEmpty) {
+        throw Exception("Profile types not found. Generate profile first.");
+      }
+
+      // Current totals
+      final now = DateTime.now();
+      final double monthlyIncome = await _dashDao.getTotalIncomeForMonth(
+        widget.studentId,
+        now,
+      );
+      final expMap = await _dashDao.getExpenseTotalsByCategoryForMonth(
+        widget.studentId,
+        now,
+      );
+
+      final double essentialsAmount = expMap["essentials"] ?? 0.0;
+      final double academicAmount = expMap["academics"] ?? 0.0;
+      final double leisureAmount = expMap["leisure"] ?? 0.0;
+      final double otherAmount = expMap["others"] ?? 0.0;
+
+      if (monthlyIncome <= 0) {
+        throw Exception("Add income first before generating recommendation.");
+      }
+
+      // Call Flask API
+      final result = await RecommendationApi.recommendBudget(
+        monthlyIncome: monthlyIncome,
+        essentialsAmount: essentialsAmount,
+        academicAmount: academicAmount,
+        leisureAmount: leisureAmount,
+        otherAmount: otherAmount,
+        incomeType: incomeType,
+        spenderType: spenderType,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        recoResult = result;
+      });
+
+      try {
+        final msg =
+            "${(result['recommendations'] as List<dynamic>).join(" | ")}\nTip: ${(result['behavior_tip'] ?? '').toString()}";
+
+        // Get existing notifications
+        final existing = await _notificationDao.getNotificationsByStudent(
+          widget.studentId,
+        );
+
+        bool alreadyExists = false;
+
+        for (final n in existing) {
+          final type = (n['type'] ?? '').toString().toLowerCase();
+          final message = (n['message'] ?? '').toString();
+
+          if (type == "recommendation" && message.trim() == msg.trim()) {
+            alreadyExists = true;
+            break;
+          }
+        }
+
+        // Insert only if it doesn't exist
+        if (!alreadyExists) {
+          await _notificationDao.insertNotification(
+            studentId: widget.studentId,
+            title: "Budget Recommendation",
+            message: msg,
+            type: "recommendation",
+            amount: 0.0,
+          );
+        }
+      } catch (_) {}
+
+      // Build canonical message text for comparison (but DO NOT persist into notifications)
+      final recList =
+          (result['recommendations'] as List?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          [];
+      final behaviorTip = (result['behavior_tip'] ?? '').toString();
+      final currentMsg =
+          recList.join(" | ") +
+          (behaviorTip.isNotEmpty ? "\nTip: $behaviorTip" : "");
+
+      // Reload history excluding any that match the current message exactly
+      await _loadRecommendationHistory(excludeMessage: currentMsg);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        recoError = e.toString();
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        recoLoading = false;
+      });
+    }
+  }
+
+  /// Load past recommendation-like notifications (<= 30 days), grouped.
+  /// If excludeMessage is provided we skip records whose message == that string.
+  Future<void> _loadRecommendationHistory({String? excludeMessage}) async {
+    final list = await _notificationDao.getNotificationsByStudent(
+      widget.studentId,
+    );
+    final recos = <Map<String, dynamic>>[];
+
+    for (final r in list) {
+      final title = (r['title'] ?? '').toString().toLowerCase();
+      final typeField = (r['type'] ?? '').toString().toLowerCase();
+      if (title.contains('recommend') ||
+          typeField == 'recommendation' ||
+          typeField == 'recommend') {
+        final m = Map<String, dynamic>.from(r);
+        final msg = (m['message'] ?? '').toString();
+
+        // exclude exact current message (so current doesn't appear in past list)
+        if (excludeMessage != null &&
+            excludeMessage.isNotEmpty &&
+            msg.trim() == excludeMessage.trim()) {
+          continue;
+        }
+
+        // parse created_at into DateTime
+        final dtStr = m['created_at']?.toString();
+        DateTime dt = DateTime.now();
+        if (dtStr != null) {
+          try {
+            dt = DateTime.parse(dtStr);
+          } catch (_) {
+            try {
+              dt = DateTime.parse(dtStr.replaceFirst(' ', 'T'));
+            } catch (_) {}
+          }
+        }
+        m['created_at_dt'] = dt;
+        recos.add(m);
+      }
+    }
+
+    // Keep only items within the last 30 days
+    final now = DateTime.now();
+    final cutoff = now.subtract(const Duration(days: 30));
+    final recos30 = recos
+        .where((r) => (r['created_at_dt'] as DateTime).isAfter(cutoff))
+        .toList();
+
+    // sort newest first
+    recos30.sort((a, b) {
+      final da = a['created_at_dt'] as DateTime;
+      final db = b['created_at_dt'] as DateTime;
+      return db.compareTo(da);
+    });
+
+    // take first 5 as recent (most recent previous recommendations)
+    final recentList = recos30.take(5).toList();
+    final remaining = recos30.skip(5);
+
+    final yesterdayList = <Map<String, dynamic>>[];
+    final last7List = <Map<String, dynamic>>[];
+    final last30List = <Map<String, dynamic>>[];
+
+    final todayDateOnly = DateTime(now.year, now.month, now.day);
+
+    for (final item in remaining) {
+      final DateTime dt = item['created_at_dt'] as DateTime;
+      final dtDateOnly = DateTime(dt.year, dt.month, dt.day);
+      final daysDiff = todayDateOnly.difference(dtDateOnly).inDays;
+
+      if (daysDiff == 1) {
+        yesterdayList.add(item);
+      } else if (daysDiff >= 2 && daysDiff <= 7) {
+        last7List.add(item);
+      } else if (daysDiff >= 8 && daysDiff <= 30) {
+        last30List.add(item);
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _recent = recentList;
+      _yesterday = yesterdayList;
+      _last7 = last7List;
+      _last30 = last30List;
+    });
+  }
+
+  // UI helper to render a past recommendation record card
+  Widget _historyCard(Map<String, dynamic> n) {
+    final title = (n['title'] ?? '').toString();
+    final msg = (n['message'] ?? '').toString();
+    final dt = n['created_at_dt'] as DateTime;
+    final time =
+        "${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}";
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.95),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: const [
+          BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, 2)),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              fontWeight: FontWeight.w600,
+              color: AppColors.primaryBlue,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(msg, style: const TextStyle(fontSize: 13)),
+          const SizedBox(height: 6),
+          Text(time, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        ],
+      ),
+    );
+  }
+
+  Widget _sectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, top: 8, bottom: 6),
+      child: Text(
+        title,
+        style: const TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+          color: AppColors.primaryBlue,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Stack(
+        children: [
+          // Background
+          Positioned.fill(
+            child: Image.asset('assets/MainScreens.jpeg', fit: BoxFit.cover),
+          ),
+
+          SafeArea(
+            child: Column(
+              children: [
+                _topBar(),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: _recommendationSection(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Top bar
+  Widget _topBar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          IconButton(
+            onPressed: () => Navigator.pop(context),
+            icon: const Icon(Icons.arrow_back, color: AppColors.primaryBlue),
+          ),
+          const SizedBox(width: 8),
+          Image.asset('assets/Intellects_Logo.png', height: 36),
+          const SizedBox(width: 10),
+          const Text(
+            "Recommendations",
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.w600,
+              color: AppColors.primaryBlue,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Recommendation section
+  Widget _recommendationSection() {
+    if (recoLoading) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.95),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: AppColors.primaryBlue, width: 1.5),
+        ),
+        child: const Row(
+          children: [
+            SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 12),
+            Expanded(child: Text("Generating budget recommendation...")),
+          ],
+        ),
+      );
+    }
+
+    if (recoError != null) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.95),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: Colors.redAccent, width: 1.5),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "Budget Recommendation",
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+                color: AppColors.primaryBlue,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              recoError!,
+              style: const TextStyle(fontSize: 12, color: Colors.redAccent),
+            ),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: loadRecommendation,
+                child: const Text("Retry"),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (recoResult == null) {
+      return const Center(child: Text("No recommendation available yet."));
+    }
+
+    final status = (recoResult!["status"] ?? "").toString();
+    final recommendations =
+        (recoResult!["recommendations"] as List?)
+            ?.map((e) => e.toString())
+            .toList() ??
+        [];
+    final behaviorTip = (recoResult!["behavior_tip"] ?? "").toString();
+
+    final essentialsPct = recoResult!["essentials_pct"];
+    final academicPct = recoResult!["academic_pct"];
+    final leisurePct = recoResult!["leisure_pct"];
+    final otherPct = recoResult!["other_pct"];
+
+    return SingleChildScrollView(
+      child: Column(
+        children: [
+          // Current recommendation card
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.95),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: AppColors.primaryBlue, width: 2),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "📌 Budget Recommendation",
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.primaryBlue,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  "Status: $status",
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                const Text(
+                  "Spending Summary",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
+                Text("• Essentials: $essentialsPct%"),
+                Text("• Academics: $academicPct%"),
+                Text("• Leisure: $leisurePct%"),
+                Text("• Others: $otherPct%"),
+                const SizedBox(height: 14),
+                const Text(
+                  "Recommendations:",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
+                ...recommendations.map(
+                  (t) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text("• $t"),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                if (behaviorTip.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  const Text(
+                    "Behavior Tip:",
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(behaviorTip),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Past Recommendations (previous 30 days)
+          if (_recent.isNotEmpty ||
+              _yesterday.isNotEmpty ||
+              _last7.isNotEmpty ||
+              _last30.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            _sectionTitle("Past Recommendations"),
+            const SizedBox(height: 8),
+            ..._recent.map(_historyCard),
+            if (_yesterday.isNotEmpty) ...[
+              _sectionTitle("Yesterday"),
+              ..._yesterday.map(_historyCard),
+            ],
+            if (_last7.isNotEmpty) ...[
+              _sectionTitle("Last 7 days"),
+              ..._last7.map(_historyCard),
+            ],
+            if (_last30.isNotEmpty) ...[
+              _sectionTitle("Last 30 days"),
+              ..._last30.map(_historyCard),
+            ],
+            const SizedBox(height: 30),
+          ] else ...[
+            const SizedBox(height: 12),
+            Center(
+              child: Text(
+                "No past recommendations recorded yet.",
+                style: TextStyle(color: Colors.grey.shade700),
+              ),
+            ),
+            const SizedBox(height: 30),
+          ],
+        ],
+      ),
+    );
+  }
+}
