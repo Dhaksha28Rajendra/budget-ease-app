@@ -258,8 +258,8 @@ University: Rajarata University of Sri Lanka
 
 Team: Team Intellects
 👥 Team Members
-- Daksagari Anandaraj
 - Dhakshanyah Rajendra
+- Daksagari Anandaraj
 - M. M. Fathima Nuha
 - M. S. Naseeha
 - Thasanicka Sivaprasagam
